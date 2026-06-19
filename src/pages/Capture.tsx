@@ -2,9 +2,36 @@ import { useRef, useState, useCallback, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Camera, Upload, RotateCcw, ChevronRight, AlertCircle, X, FlipHorizontal } from 'lucide-react'
 import { loadModel } from '../analysis/postureEngine'
+import { PoseLandmarker, FilesetResolver } from '@mediapipe/tasks-vision'
 
 type Mode = 'choose' | 'camera' | 'preview'
 type FacingMode = 'environment' | 'user'
+type DetectionStatus = 'waiting' | 'partial' | 'ready' | 'countdown' | 'captured'
+
+interface DetectionFeedback {
+  status: DetectionStatus
+  message: string
+  confidence: number  // 0-1, how complete the body detection is
+}
+
+// Key landmark indices we need visible for a good posture scan
+const REQUIRED_LANDMARKS = [
+  0,   // nose
+  7,   // left ear
+  8,   // right ear
+  11,  // left shoulder
+  12,  // right shoulder
+  23,  // left hip
+  24,  // right hip
+  25,  // left knee
+  26,  // right knee
+  27,  // left ankle
+  28,  // right ankle
+]
+
+const VISIBILITY_THRESHOLD = 0.5
+const STABLE_FRAMES_NEEDED = 4   // ~2s at 500ms interval
+const COUNTDOWN_FROM = 3
 
 export default function Capture() {
   const navigate = useNavigate()
@@ -12,6 +39,11 @@ export default function Capture() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const streamRef = useRef<MediaStream | null>(null)
+  const detectorRef = useRef<PoseLandmarker | null>(null)
+  const detectionIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const stableFramesRef = useRef(0)
+  const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const capturedRef = useRef(false)
 
   const [mode, setMode] = useState<Mode>('choose')
   const [capturedImage, setCapturedImage] = useState<string | null>(null)
@@ -19,18 +51,192 @@ export default function Capture() {
   const [modelLoading, setModelLoading] = useState(false)
   const [cameraReady, setCameraReady] = useState(false)
   const [facingMode, setFacingMode] = useState<FacingMode>('environment')
-  const [hasMultipleCameras, setHasMultipleCameras] = useState(false)
   const [switching, setSwitching] = useState(false)
+  const [feedback, setFeedback] = useState<DetectionFeedback>({
+    status: 'waiting', message: 'Position yourself in frame', confidence: 0
+  })
+  const [countdown, setCountdown] = useState<number | null>(null)
+  const [silhouetteReady, setSilhouetteReady] = useState(false)
 
-  // Preload model on mount
+  // Load both main model and lightweight detector
   useEffect(() => {
-    loadModel().catch(() => {})
-    // Check if device has multiple cameras
+    const init = async () => {
+      setModelLoading(true)
+      try {
+        await loadModel()
+        // Also load a separate instance for live detection
+        const vision = await FilesetResolver.forVisionTasks(
+          'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm'
+        )
+        detectorRef.current = await PoseLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath:
+              'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',
+            delegate: 'GPU'
+          },
+          runningMode: 'IMAGE',
+          numPoses: 1
+        })
+      } catch (_) {}
+      setModelLoading(false)
+    }
+    init()
+
     navigator.mediaDevices.enumerateDevices().then(devices => {
-      const videoDevices = devices.filter(d => d.kind === 'videoinput')
-      setHasMultipleCameras(videoDevices.length > 1)
+      // just checking — no state needed, flip button always shown on mobile
     }).catch(() => {})
+
+    return () => { stopDetection() }
   }, [])
+
+  const stopDetection = () => {
+    if (detectionIntervalRef.current) {
+      clearInterval(detectionIntervalRef.current)
+      detectionIntervalRef.current = null
+    }
+    if (countdownRef.current) {
+      clearInterval(countdownRef.current)
+      countdownRef.current = null
+    }
+    stableFramesRef.current = 0
+    capturedRef.current = false
+  }
+
+  const stopCamera = useCallback(() => {
+    stopDetection()
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(t => t.stop())
+      streamRef.current = null
+    }
+    setCameraReady(false)
+    setSilhouetteReady(false)
+  }, [])
+
+  const checkBody = useCallback(() => {
+    if (!videoRef.current || !detectorRef.current || capturedRef.current) return
+    const video = videoRef.current
+    if (video.readyState < 2) return
+
+    try {
+      const results = detectorRef.current.detect(video)
+
+      if (!results.landmarks || results.landmarks.length === 0) {
+        stableFramesRef.current = 0
+        setFeedback({ status: 'waiting', message: 'No person detected — step into frame', confidence: 0 })
+        setSilhouetteReady(false)
+        return
+      }
+
+      const lm = results.landmarks[0]
+
+      // Count how many required landmarks are visible
+      const visibleCount = REQUIRED_LANDMARKS.filter(
+        idx => (lm[idx]?.visibility ?? 0) > VISIBILITY_THRESHOLD
+      ).length
+      const confidence = visibleCount / REQUIRED_LANDMARKS.length
+
+      // Check specific missing areas for targeted feedback
+      const headVisible = (lm[0]?.visibility ?? 0) > VISIBILITY_THRESHOLD
+      const feetVisible =
+        (lm[27]?.visibility ?? 0) > VISIBILITY_THRESHOLD ||
+        (lm[28]?.visibility ?? 0) > VISIBILITY_THRESHOLD
+      const hipsVisible =
+        (lm[23]?.visibility ?? 0) > VISIBILITY_THRESHOLD &&
+        (lm[24]?.visibility ?? 0) > VISIBILITY_THRESHOLD
+
+      if (!headVisible) {
+        stableFramesRef.current = 0
+        setSilhouetteReady(false)
+        setFeedback({ status: 'partial', message: 'Move back — head not visible', confidence })
+        return
+      }
+      if (!feetVisible) {
+        stableFramesRef.current = 0
+        setSilhouetteReady(false)
+        setFeedback({ status: 'partial', message: 'Move back — full legs not visible', confidence })
+        return
+      }
+      if (!hipsVisible) {
+        stableFramesRef.current = 0
+        setSilhouetteReady(false)
+        setFeedback({ status: 'partial', message: 'Turn slightly — hips not visible', confidence })
+        return
+      }
+      if (confidence < 0.8) {
+        stableFramesRef.current = 0
+        setSilhouetteReady(false)
+        setFeedback({ status: 'partial', message: 'Almost there — ensure full body is visible', confidence })
+        return
+      }
+
+      // Body fully detected
+      stableFramesRef.current += 1
+      setSilhouetteReady(true)
+
+      if (stableFramesRef.current < STABLE_FRAMES_NEEDED) {
+        const remaining = STABLE_FRAMES_NEEDED - stableFramesRef.current
+        setFeedback({
+          status: 'ready',
+          message: `Hold still… (${remaining})`,
+          confidence
+        })
+        return
+      }
+
+      // Start countdown if not already
+      if (stableFramesRef.current === STABLE_FRAMES_NEEDED) {
+        setFeedback({ status: 'countdown', message: 'Perfect! Capturing...', confidence })
+        stopDetection()
+        startCountdown()
+      }
+    } catch (_) {}
+  }, [])
+
+  const startCountdown = () => {
+    let count = COUNTDOWN_FROM
+    setCountdown(count)
+    countdownRef.current = setInterval(() => {
+      count -= 1
+      if (count <= 0) {
+        clearInterval(countdownRef.current!)
+        countdownRef.current = null
+        setCountdown(null)
+        triggerCapture()
+      } else {
+        setCountdown(count)
+      }
+    }, 1000)
+  }
+
+  const triggerCapture = useCallback(() => {
+    if (capturedRef.current || !videoRef.current || !canvasRef.current) return
+    capturedRef.current = true
+    const video = videoRef.current
+    const canvas = canvasRef.current
+    canvas.width = video.videoWidth
+    canvas.height = video.videoHeight
+    const ctx = canvas.getContext('2d')!
+    if (facingMode === 'user') {
+      ctx.translate(canvas.width, 0)
+      ctx.scale(-1, 1)
+    }
+    ctx.drawImage(video, 0, 0)
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.92)
+    setCapturedImage(dataUrl)
+    setMode('preview')
+    stopCamera()
+  }, [facingMode, stopCamera])
+
+  const startDetectionLoop = useCallback(() => {
+    stopDetection()
+    stableFramesRef.current = 0
+    capturedRef.current = false
+    setFeedback({ status: 'waiting', message: 'Position yourself in frame', confidence: 0 })
+    setSilhouetteReady(false)
+    setCountdown(null)
+    // Poll every 500ms
+    detectionIntervalRef.current = setInterval(checkBody, 500)
+  }, [checkBody])
 
   const startCamera = async (facing: FacingMode = facingMode) => {
     setError(null)
@@ -43,7 +249,11 @@ export default function Capture() {
       streamRef.current = stream
       if (videoRef.current) {
         videoRef.current.srcObject = stream
-        videoRef.current.onloadedmetadata = () => setCameraReady(true)
+        videoRef.current.onloadedmetadata = () => {
+          setCameraReady(true)
+          // Start detection loop after camera is ready
+          setTimeout(startDetectionLoop, 800)
+        }
       }
     } catch {
       setError('Camera access denied. Please allow camera permissions and try again, or upload a photo instead.')
@@ -54,13 +264,14 @@ export default function Capture() {
   const switchCamera = async () => {
     if (switching) return
     setSwitching(true)
+    stopDetection()
     const next: FacingMode = facingMode === 'environment' ? 'user' : 'environment'
-    // Stop current stream first
     if (streamRef.current) {
       streamRef.current.getTracks().forEach(t => t.stop())
       streamRef.current = null
     }
     setCameraReady(false)
+    setSilhouetteReady(false)
     setFacingMode(next)
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -69,11 +280,13 @@ export default function Capture() {
       streamRef.current = stream
       if (videoRef.current) {
         videoRef.current.srcObject = stream
-        videoRef.current.onloadedmetadata = () => setCameraReady(true)
+        videoRef.current.onloadedmetadata = () => {
+          setCameraReady(true)
+          setTimeout(startDetectionLoop, 800)
+        }
       }
     } catch {
       setError('Could not switch camera. Your device may only have one camera.')
-      // Fall back to original
       setFacingMode(facingMode)
       await startCamera(facingMode)
     } finally {
@@ -81,40 +294,10 @@ export default function Capture() {
     }
   }
 
-  const stopCamera = useCallback(() => {
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(t => t.stop())
-      streamRef.current = null
-    }
-    setCameraReady(false)
-  }, [])
-
-  const capturePhoto = () => {
-    if (!videoRef.current || !canvasRef.current) return
-    const video = videoRef.current
-    const canvas = canvasRef.current
-    canvas.width = video.videoWidth
-    canvas.height = video.videoHeight
-    const ctx = canvas.getContext('2d')!
-    // Mirror front camera so landmarks are anatomically correct
-    if (facingMode === 'user') {
-      ctx.translate(canvas.width, 0)
-      ctx.scale(-1, 1)
-    }
-    ctx.drawImage(video, 0, 0)
-    const dataUrl = canvas.toDataURL('image/jpeg', 0.92)
-    setCapturedImage(dataUrl)
-    setMode('preview')
-    stopCamera()
-  }
-
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (!file) return
-    if (!file.type.startsWith('image/')) {
-      setError('Please select an image file.')
-      return
-    }
+    if (!file.type.startsWith('image/')) { setError('Please select an image file.'); return }
     const reader = new FileReader()
     reader.onload = (ev) => {
       setCapturedImage(ev.target?.result as string)
@@ -123,10 +306,8 @@ export default function Capture() {
     reader.readAsDataURL(file)
   }
 
-  const analyzePhoto = async () => {
+  const analyzePhoto = () => {
     if (!capturedImage) return
-    setModelLoading(true)
-    setError(null)
     sessionStorage.setItem('capturedImage', capturedImage)
     navigate('/analyzing')
   }
@@ -136,9 +317,22 @@ export default function Capture() {
     setCapturedImage(null)
     setMode('choose')
     setError(null)
+    setCountdown(null)
+    setSilhouetteReady(false)
   }
 
   useEffect(() => () => stopCamera(), [stopCamera])
+
+  // Feedback bar config
+  const feedbackConfig = {
+    waiting:   { bg: 'bg-black/50',        text: 'text-white',        icon: '👤' },
+    partial:   { bg: 'bg-amber-500/90',    text: 'text-white',        icon: '⚠️' },
+    ready:     { bg: 'bg-blue-500/90',     text: 'text-white',        icon: '✓' },
+    countdown: { bg: 'bg-emerald-500/90',  text: 'text-white',        icon: '📸' },
+    captured:  { bg: 'bg-emerald-500/90',  text: 'text-white',        icon: '✓' },
+  }
+
+  const fb = feedbackConfig[feedback.status]
 
   return (
     <div className="min-h-screen bg-gray-50 flex flex-col">
@@ -167,10 +361,10 @@ export default function Capture() {
       </div>
 
       {/* Instruction banner */}
-      {mode !== 'preview' && (
+      {mode === 'choose' && (
         <div className="bg-emerald-50 border-b border-emerald-100 px-4 py-3">
           <p className="text-emerald-800 text-sm font-medium">For best results:</p>
-          <p className="text-emerald-700 text-xs mt-0.5">Stand side-on (left or right) · Full body visible · Good lighting · Wear fitted clothing · Stand 1.5–2m from camera</p>
+          <p className="text-emerald-700 text-xs mt-0.5">Stand side-on · Full body visible · Good lighting · Wear fitted clothing · Stand 1.5–2m from camera</p>
         </div>
       )}
 
@@ -188,18 +382,19 @@ export default function Capture() {
           <div className="w-full max-w-sm space-y-3">
             <div className="text-center mb-6">
               <h2 className="text-xl font-bold text-gray-900">Take your posture photo</h2>
-              <p className="text-gray-500 text-sm mt-1">Use camera or upload an existing photo</p>
+              <p className="text-gray-500 text-sm mt-1">Place your phone on a surface, step back — it captures automatically</p>
             </div>
             <button
               onClick={() => startCamera(facingMode)}
-              className="w-full bg-emerald-500 text-white rounded-xl p-5 flex items-center gap-4 hover:bg-emerald-600 transition-colors active:scale-95"
+              disabled={modelLoading}
+              className="w-full bg-emerald-500 text-white rounded-xl p-5 flex items-center gap-4 hover:bg-emerald-600 transition-colors active:scale-95 disabled:opacity-60"
             >
               <div className="w-12 h-12 bg-emerald-400 rounded-lg flex items-center justify-center flex-shrink-0">
                 <Camera size={24} className="text-white" />
               </div>
               <div className="text-left">
-                <div className="font-semibold">Use camera</div>
-                <div className="text-emerald-100 text-sm">Take photo now with your device</div>
+                <div className="font-semibold">{modelLoading ? 'Loading AI…' : 'Use camera'}</div>
+                <div className="text-emerald-100 text-sm">Auto-captures when you're in position</div>
               </div>
               <ChevronRight size={18} className="text-emerald-300 ml-auto" />
             </button>
@@ -217,6 +412,17 @@ export default function Capture() {
               <ChevronRight size={18} className="text-gray-300 ml-auto" />
             </button>
             <input ref={fileInputRef} type="file" accept="image/*" className="hidden" onChange={handleFileUpload} />
+
+            {/* How it works hint */}
+            <div className="bg-blue-50 border border-blue-100 rounded-xl p-3 mt-2">
+              <p className="text-blue-700 text-xs font-medium mb-1">How auto-capture works</p>
+              <p className="text-blue-600 text-xs leading-relaxed">
+                1. Prop your phone against a wall or use a stand<br/>
+                2. Tap "Use camera" then step back 1.5–2m<br/>
+                3. Stand side-on — AI detects your body automatically<br/>
+                4. Hold still for 2 seconds → photo taken!
+              </p>
+            </div>
           </div>
         )}
 
@@ -232,20 +438,69 @@ export default function Capture() {
                 className="w-full h-full object-cover"
                 style={facingMode === 'user' ? { transform: 'scaleX(-1)' } : {}}
               />
-              {/* Silhouette guide overlay */}
+
+              {/* Silhouette guide — dims/brightens based on detection */}
               <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-                <svg viewBox="0 0 120 200" className="h-4/5 opacity-30" fill="none">
-                  <ellipse cx="60" cy="20" rx="12" ry="14" stroke="white" strokeWidth="1.5"/>
-                  <line x1="60" y1="34" x2="60" y2="100" stroke="white" strokeWidth="1.5"/>
-                  <line x1="30" y1="55" x2="90" y2="55" stroke="white" strokeWidth="1.5"/>
-                  <line x1="60" y1="100" x2="45" y2="150" stroke="white" strokeWidth="1.5"/>
-                  <line x1="60" y1="100" x2="75" y2="150" stroke="white" strokeWidth="1.5"/>
-                  <line x1="45" y1="150" x2="42" y2="195" stroke="white" strokeWidth="1.5"/>
-                  <line x1="75" y1="150" x2="78" y2="195" stroke="white" strokeWidth="1.5"/>
+                <svg viewBox="0 0 120 200" className="h-4/5 transition-opacity duration-500" fill="none"
+                  style={{ opacity: silhouetteReady ? 0.9 : 0.25 }}>
+                  <ellipse cx="60" cy="20" rx="12" ry="14"
+                    stroke={silhouetteReady ? '#10b981' : 'white'} strokeWidth="1.5"/>
+                  <line x1="60" y1="34" x2="60" y2="100"
+                    stroke={silhouetteReady ? '#10b981' : 'white'} strokeWidth="1.5"/>
+                  <line x1="30" y1="55" x2="90" y2="55"
+                    stroke={silhouetteReady ? '#10b981' : 'white'} strokeWidth="1.5"/>
+                  <line x1="60" y1="100" x2="45" y2="150"
+                    stroke={silhouetteReady ? '#10b981' : 'white'} strokeWidth="1.5"/>
+                  <line x1="60" y1="100" x2="75" y2="150"
+                    stroke={silhouetteReady ? '#10b981' : 'white'} strokeWidth="1.5"/>
+                  <line x1="45" y1="150" x2="42" y2="195"
+                    stroke={silhouetteReady ? '#10b981' : 'white'} strokeWidth="1.5"/>
+                  <line x1="75" y1="150" x2="78" y2="195"
+                    stroke={silhouetteReady ? '#10b981' : 'white'} strokeWidth="1.5"/>
                 </svg>
-                <div className="absolute inset-0 border-2 border-white/20 m-4 rounded-xl" />
+                {/* Border frame */}
+                <div className={`absolute inset-0 border-2 m-4 rounded-xl transition-colors duration-500
+                  ${silhouetteReady ? 'border-emerald-400/60' : 'border-white/20'}`} />
               </div>
-              {/* Flip camera button — top right corner */}
+
+              {/* Countdown overlay */}
+              {countdown !== null && (
+                <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                  <div className="w-24 h-24 bg-emerald-500/80 rounded-full flex items-center justify-center">
+                    <span className="text-white text-5xl font-bold">{countdown}</span>
+                  </div>
+                </div>
+              )}
+
+              {/* Confidence bar — top of viewfinder */}
+              {cameraReady && feedback.status !== 'waiting' && (
+                <div className="absolute top-0 left-0 right-0 h-1 bg-white/20">
+                  <div
+                    className="h-full transition-all duration-300"
+                    style={{
+                      width: `${Math.round(feedback.confidence * 100)}%`,
+                      background: feedback.confidence >= 0.8 ? '#10b981' : feedback.confidence >= 0.5 ? '#f59e0b' : '#ef4444'
+                    }}
+                  />
+                </div>
+              )}
+
+              {/* Feedback pill */}
+              {cameraReady && (
+                <div className={`absolute bottom-4 left-4 right-4 ${fb.bg} backdrop-blur-sm rounded-xl px-3 py-2.5 flex items-center gap-2 transition-all duration-300`}>
+                  <span className="text-base">{fb.icon}</span>
+                  <span className={`text-sm font-medium ${fb.text} flex-1`}>{feedback.message}</span>
+                  {feedback.status === 'ready' || feedback.status === 'countdown' ? (
+                    <div className="flex gap-0.5">
+                      {[...Array(STABLE_FRAMES_NEEDED)].map((_, i) => (
+                        <div key={i} className={`w-1.5 h-1.5 rounded-full ${i < stableFramesRef.current ? 'bg-white' : 'bg-white/30'}`} />
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              )}
+
+              {/* Flip button */}
               <button
                 onClick={switchCamera}
                 disabled={switching}
@@ -257,36 +512,44 @@ export default function Capture() {
                   : <FlipHorizontal size={18} />
                 }
               </button>
-              {/* Camera label pill */}
+
+              {/* Camera label */}
               <div className="absolute top-3 left-3 bg-black/40 backdrop-blur-sm text-white text-xs px-2.5 py-1 rounded-full">
                 {facingMode === 'environment' ? 'Back camera' : 'Front camera'}
               </div>
+
               {!cameraReady && (
-                <div className="absolute inset-0 flex items-center justify-center bg-black/50">
-                  <div className="text-white text-sm">Starting camera...</div>
+                <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/60 gap-3">
+                  <div className="w-8 h-8 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                  <div className="text-white text-sm">Starting camera…</div>
                 </div>
               )}
             </div>
+
             <canvas ref={canvasRef} className="hidden" />
-            {/* Tip for front camera */}
+
+            {/* Front camera tip */}
             {facingMode === 'user' && (
               <div className="bg-blue-50 border border-blue-100 rounded-xl p-2.5 mt-2 flex gap-2">
                 <AlertCircle size={14} className="text-blue-400 flex-shrink-0 mt-0.5" />
-                <p className="text-blue-600 text-xs">Tip: Back camera gives more accurate results. Use front camera only if you need to scan alone.</p>
+                <p className="text-blue-600 text-xs">Tip: Back camera gives more accurate results. Use front camera only if scanning alone.</p>
               </div>
             )}
+
+            {/* Manual capture fallback */}
             <div className="flex gap-3 mt-3">
-              <button onClick={reset} className="flex-1 border border-gray-200 text-gray-600 rounded-xl py-3 font-medium hover:bg-gray-50">
+              <button onClick={reset} className="border border-gray-200 text-gray-600 rounded-xl py-3 px-5 font-medium hover:bg-gray-50 text-sm">
                 Cancel
               </button>
               <button
-                onClick={capturePhoto}
+                onClick={triggerCapture}
                 disabled={!cameraReady}
-                className="flex-1 bg-emerald-500 text-white rounded-xl py-3 font-medium hover:bg-emerald-600 disabled:opacity-50 flex items-center justify-center gap-2"
+                className="flex-1 border border-emerald-200 text-emerald-600 bg-emerald-50 rounded-xl py-3 font-medium hover:bg-emerald-100 disabled:opacity-40 flex items-center justify-center gap-2 text-sm"
               >
-                <Camera size={18} /> Capture
+                <Camera size={16} /> Capture manually
               </button>
             </div>
+            <p className="text-center text-xs text-gray-400 mt-2">Auto-captures when full body is detected · or tap above</p>
           </div>
         )}
 
@@ -296,20 +559,19 @@ export default function Capture() {
             <div className="rounded-2xl overflow-hidden border border-gray-200 aspect-[3/4] bg-black">
               <img src={capturedImage} alt="Captured posture" className="w-full h-full object-contain" />
             </div>
-            <div className="bg-amber-50 border border-amber-100 rounded-xl p-3 mt-3 flex gap-2">
-              <AlertCircle size={16} className="text-amber-500 flex-shrink-0 mt-0.5" />
-              <p className="text-amber-700 text-xs">Make sure your full body (head to feet) is visible in the photo</p>
+            <div className="bg-emerald-50 border border-emerald-100 rounded-xl p-3 mt-3 flex gap-2">
+              <span className="text-emerald-500 text-base">✓</span>
+              <p className="text-emerald-700 text-xs font-medium">Photo captured! Make sure your full body (head to feet) is visible before analysing.</p>
             </div>
             <div className="flex gap-3 mt-3">
-              <button onClick={reset} className="flex items-center gap-1.5 border border-gray-200 text-gray-600 rounded-xl py-3 px-4 font-medium hover:bg-gray-50">
+              <button onClick={reset} className="flex items-center gap-1.5 border border-gray-200 text-gray-600 rounded-xl py-3 px-4 font-medium hover:bg-gray-50 text-sm">
                 <RotateCcw size={16} /> Retake
               </button>
               <button
                 onClick={analyzePhoto}
-                disabled={modelLoading}
-                className="flex-1 bg-emerald-500 text-white rounded-xl py-3 font-medium hover:bg-emerald-600 disabled:opacity-70 flex items-center justify-center gap-2"
+                className="flex-1 bg-emerald-500 text-white rounded-xl py-3 font-medium hover:bg-emerald-600 flex items-center justify-center gap-2 text-sm"
               >
-                {modelLoading ? 'Loading...' : <>Analyse posture <ChevronRight size={18} /></>}
+                Analyse posture <ChevronRight size={18} />
               </button>
             </div>
           </div>
