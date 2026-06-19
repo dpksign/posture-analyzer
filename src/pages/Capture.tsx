@@ -1,9 +1,10 @@
 import { useRef, useState, useCallback, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Camera, Upload, RotateCcw, ChevronRight, AlertCircle, X } from 'lucide-react'
+import { Camera, Upload, RotateCcw, ChevronRight, AlertCircle, X, FlipHorizontal } from 'lucide-react'
 import { loadModel } from '../analysis/postureEngine'
 
 type Mode = 'choose' | 'camera' | 'preview'
+type FacingMode = 'environment' | 'user'
 
 export default function Capture() {
   const navigate = useNavigate()
@@ -17,18 +18,27 @@ export default function Capture() {
   const [error, setError] = useState<string | null>(null)
   const [modelLoading, setModelLoading] = useState(false)
   const [cameraReady, setCameraReady] = useState(false)
+  const [facingMode, setFacingMode] = useState<FacingMode>('environment')
+  const [hasMultipleCameras, setHasMultipleCameras] = useState(false)
+  const [switching, setSwitching] = useState(false)
 
   // Preload model on mount
   useEffect(() => {
     loadModel().catch(() => {})
+    // Check if device has multiple cameras
+    navigator.mediaDevices.enumerateDevices().then(devices => {
+      const videoDevices = devices.filter(d => d.kind === 'videoinput')
+      setHasMultipleCameras(videoDevices.length > 1)
+    }).catch(() => {})
   }, [])
 
-  const startCamera = async () => {
+  const startCamera = async (facing: FacingMode = facingMode) => {
     setError(null)
     setMode('camera')
+    setCameraReady(false)
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }
+        video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 } }
       })
       streamRef.current = stream
       if (videoRef.current) {
@@ -38,6 +48,36 @@ export default function Capture() {
     } catch {
       setError('Camera access denied. Please allow camera permissions and try again, or upload a photo instead.')
       setMode('choose')
+    }
+  }
+
+  const switchCamera = async () => {
+    if (switching) return
+    setSwitching(true)
+    const next: FacingMode = facingMode === 'environment' ? 'user' : 'environment'
+    // Stop current stream first
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(t => t.stop())
+      streamRef.current = null
+    }
+    setCameraReady(false)
+    setFacingMode(next)
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: next, width: { ideal: 1280 }, height: { ideal: 720 } }
+      })
+      streamRef.current = stream
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream
+        videoRef.current.onloadedmetadata = () => setCameraReady(true)
+      }
+    } catch {
+      setError('Could not switch camera. Your device may only have one camera.')
+      // Fall back to original
+      setFacingMode(facingMode)
+      await startCamera(facingMode)
+    } finally {
+      setSwitching(false)
     }
   }
 
@@ -56,6 +96,11 @@ export default function Capture() {
     canvas.width = video.videoWidth
     canvas.height = video.videoHeight
     const ctx = canvas.getContext('2d')!
+    // Mirror front camera so landmarks are anatomically correct
+    if (facingMode === 'user') {
+      ctx.translate(canvas.width, 0)
+      ctx.scale(-1, 1)
+    }
     ctx.drawImage(video, 0, 0)
     const dataUrl = canvas.toDataURL('image/jpeg', 0.92)
     setCapturedImage(dataUrl)
@@ -146,7 +191,7 @@ export default function Capture() {
               <p className="text-gray-500 text-sm mt-1">Use camera or upload an existing photo</p>
             </div>
             <button
-              onClick={startCamera}
+              onClick={() => startCamera(facingMode)}
               className="w-full bg-emerald-500 text-white rounded-xl p-5 flex items-center gap-4 hover:bg-emerald-600 transition-colors active:scale-95"
             >
               <div className="w-12 h-12 bg-emerald-400 rounded-lg flex items-center justify-center flex-shrink-0">
@@ -179,7 +224,14 @@ export default function Capture() {
         {mode === 'camera' && (
           <div className="w-full max-w-sm">
             <div className="relative bg-black rounded-2xl overflow-hidden aspect-[3/4]">
-              <video ref={videoRef} autoPlay playsInline muted className="w-full h-full object-cover" />
+              <video
+                ref={videoRef}
+                autoPlay
+                playsInline
+                muted
+                className="w-full h-full object-cover"
+                style={facingMode === 'user' ? { transform: 'scaleX(-1)' } : {}}
+              />
               {/* Silhouette guide overlay */}
               <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
                 <svg viewBox="0 0 120 200" className="h-4/5 opacity-30" fill="none">
@@ -193,6 +245,22 @@ export default function Capture() {
                 </svg>
                 <div className="absolute inset-0 border-2 border-white/20 m-4 rounded-xl" />
               </div>
+              {/* Flip camera button — top right corner */}
+              <button
+                onClick={switchCamera}
+                disabled={switching}
+                className="absolute top-3 right-3 w-10 h-10 bg-black/40 backdrop-blur-sm rounded-full flex items-center justify-center text-white hover:bg-black/60 active:scale-90 transition-all disabled:opacity-40"
+                aria-label="Switch camera"
+              >
+                {switching
+                  ? <div className="w-4 h-4 border-2 border-white/40 border-t-white rounded-full animate-spin" />
+                  : <FlipHorizontal size={18} />
+                }
+              </button>
+              {/* Camera label pill */}
+              <div className="absolute top-3 left-3 bg-black/40 backdrop-blur-sm text-white text-xs px-2.5 py-1 rounded-full">
+                {facingMode === 'environment' ? 'Back camera' : 'Front camera'}
+              </div>
               {!cameraReady && (
                 <div className="absolute inset-0 flex items-center justify-center bg-black/50">
                   <div className="text-white text-sm">Starting camera...</div>
@@ -200,7 +268,14 @@ export default function Capture() {
               )}
             </div>
             <canvas ref={canvasRef} className="hidden" />
-            <div className="flex gap-3 mt-4">
+            {/* Tip for front camera */}
+            {facingMode === 'user' && (
+              <div className="bg-blue-50 border border-blue-100 rounded-xl p-2.5 mt-2 flex gap-2">
+                <AlertCircle size={14} className="text-blue-400 flex-shrink-0 mt-0.5" />
+                <p className="text-blue-600 text-xs">Tip: Back camera gives more accurate results. Use front camera only if you need to scan alone.</p>
+              </div>
+            )}
+            <div className="flex gap-3 mt-3">
               <button onClick={reset} className="flex-1 border border-gray-200 text-gray-600 rounded-xl py-3 font-medium hover:bg-gray-50">
                 Cancel
               </button>
